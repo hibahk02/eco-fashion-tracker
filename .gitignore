@@ -1,0 +1,19 @@
+
+drive/
+sample_data/
+*.gdoc
+node_modules/
+*.zip
+logs.txt
+ngrok
+user_results.csv
+preprocessor.pkl
+# Colab and system files
+
+# Node and local environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
