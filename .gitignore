@@ -1,0 +1,16 @@
+# Colab / system
+.config/
+drive/
+sample_data/
+__pycache__/
+*.ipynb_checkpoints
+
+# Model artifacts - ignore big ones by default
+*.pkl
+!best_model.pkl
+!label_encoder.pkl
+!preprocessor.pkl
+
+# OS junk
+.DS_Store
+Thumbs.db
