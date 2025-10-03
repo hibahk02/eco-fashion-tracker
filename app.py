@@ -77,17 +77,25 @@ def load_artifacts():
 
 best_model, preprocessor = load_artifacts()
 
-# === Bulletproof schema helpers ===
+# === Bulletproof schema + safe predict (replace your helpers with this) ===
 def _expected_features(preproc):
+    # Exact schema that preprocessor.transform expects
     if preproc is not None and hasattr(preproc, "feature_names_in_"):
         return list(preproc.feature_names_in_)
     return []
+
+def _is_probably_text(colname: str) -> bool:
+    # Heuristic for categorical vs numeric names
+    tokens = ["type","name","id","country","certification","trend",
+              "material","brand","program","eco","recycling","product","market"]
+    cl = str(colname).lower()
+    return any(tok in cl for tok in tokens)
 
 def _align_to_expected_schema(expected_cols, df_in):
     import pandas as pd
     aligned = df_in.copy()
 
-    # Build encoded recycling if expected
+    # Create encoded recycling flag if the preprocessor expects it
     if "Recycling_Programs_Encoded" in expected_cols and "Recycling_Programs_Encoded" not in aligned.columns:
         if "Recycling_Programs" in aligned.columns:
             aligned["Recycling_Programs_Encoded"] = (
@@ -96,40 +104,64 @@ def _align_to_expected_schema(expected_cols, df_in):
         else:
             aligned["Recycling_Programs_Encoded"] = 0
 
-    # Fill any missing cols
+    # Ensure ALL expected columns exist
     for c in expected_cols:
         if c not in aligned.columns:
-            # Categorical/text-like columns
-            if any(tok in c.lower() for tok in [
-                "type","name","id","country","certification","trend",
-                "material","brand","program","eco","recycling","product","market"
-            ]):
-                aligned[c] = ""
-            else:  # Numeric-like columns
-                aligned[c] = 0.0
+            aligned[c] = "" if _is_probably_text(c) else 0.0
 
-    # Drop extras + reorder
+    # Dtype enforcement (prevents astype errors inside sklearn)
+    import pandas as pd
+    for c in aligned.columns:
+        if _is_probably_text(c):
+            aligned[c] = aligned[c].astype(str)
+        else:
+            aligned[c] = pd.to_numeric(aligned[c], errors="coerce").fillna(0.0)
+
+    # Exact order + drop extras
     aligned = aligned.reindex(columns=expected_cols)
+
+    # Optional: friendly integer for Year if present
+    if "Year" in aligned.columns:
+        aligned["Year"] = pd.to_numeric(aligned["Year"], errors="coerce").fillna(0).astype("Int64")
 
     return aligned
 
-def predict_aligned(model, preproc, df_in, debug=False, st=None):
+def predict_aligned(model, preproc, df_in, *, debug=False, st=None):
+    import pandas as pd
     expected = _expected_features(preproc)
     aligned = _align_to_expected_schema(expected, df_in)
 
-    if debug and st:
+    def predict_aligned(model, preproc, df_in, *, debug=False, st=None):
+    import pandas as pd
+    expected = _expected_features(preproc)
+    aligned = _align_to_expected_schema(expected, df_in)
+
+    if debug and st is not None:
         missing = [c for c in expected if c not in df_in.columns]
-        extra = [c for c in df_in.columns if c not in expected]
-        st.write("🔍 Expected count:", len(expected))
-        st.write("❌ Missing in input:", missing[:20], "..." if len(missing) > 20 else "")
-        st.write("⚠️ Extra in input:", extra)
+        extra   = [c for c in df_in.columns if c not in expected]
+        st.write("🔍 Expected feature count:", len(expected))
+        st.write("❌ Missing in raw input (auto-filled):", missing[:30], "..." if len(missing) > 30 else "")
+        st.write("⚠️ Extra in raw input (dropped):", extra)
+        st.write("🧪 Aligned dtypes:", aligned.dtypes.astype(str).to_dict())
 
-    X = preproc.transform(aligned)
-    return model.predict(X)
+    try:
+        X = preproc.transform(aligned) if preproc is not None else aligned
+    except Exception as e:
+        if st is not None:
+            st.error("Preprocessor transform failed. Showing diagnostics:")
+            st.dataframe(aligned.head(3))
+            st.write("Aligned dtypes:", aligned.dtypes.astype(str).to_dict())
+            st.exception(e)
+        raise
 
+    try:
+        return model.predict(X)
+    except Exception as e:
+        if st is not None:
+            st.error("Model predict failed. Showing diagnostics:")
+            st.exception(e)
+        raise
 # === end helpers ===
-
-
 
 
 
@@ -246,18 +278,14 @@ if menu == f"{emoji_score} Score a Product":
             })
 
             if debug_mode:
-                exp = _expected_features(preprocessor, best_model)
-                st.write("Expected feature count:", len(exp))
-                st.write("First 10 expected:", exp[:10])
-                aligned_preview = _align_to_expected_schema(exp, input_df)
-                st.write("Aligned preview columns:", list(aligned_preview.columns)[:10], "…")
-                if preprocessor is not None:
-                    try:
-                        Xt_prev = preprocessor.transform(aligned_preview)
-                        shape = getattr(Xt_prev, "shape", None)
-                        st.write("Transformed shape:", shape)
-                    except Exception as e:
-                        st.warning(f"Preprocessor preview failed: {e}")
+            _aligned_preview = _align_to_expected_schema(_expected_features(preprocessor), input_df)
+            try:
+                Xt_prev = preprocessor.transform(_aligned_preview)
+                # Sparse/dense check is optional; shape is what you want to see
+                st.write("✅ Preprocessor preview OK. Transformed shape:", getattr(Xt_prev, "shape", None))
+            except Exception as e:
+                st.warning("Preprocessor preview failed:")
+                st.exception(e)
 
 
             # Optional: show transformed shape ONLY if we have a preprocessor
@@ -277,11 +305,12 @@ if menu == f"{emoji_score} Score a Product":
 
 
             # Predict on preprocessed, aligned features
-            pred_numeric = predict_aligned(best_model, preprocessor, input_df, debug=debug_mode, st=st)[0]
+            pred_numeric = float(predict_aligned(best_model, preprocessor, input_df, debug=debug_mode, st=st)[0])
 
-            # Compute thresholds from a sample of the dataset (also preprocessed)
+            # and for the sample predictions:
             sample_df = df.sample(500 if len(df) > 500 else len(df)).copy()
-            sample_preds = predict_aligned(best_model, preprocessor, sample_df)
+            sample_preds = predict_aligned(best_model, preprocessor, sample_df, debug=debug_mode, st=st)
+
 
 
 
