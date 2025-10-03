@@ -77,32 +77,35 @@ def load_artifacts():
 
 best_model, preprocessor = load_artifacts()
 
-# === Unified schema helpers (use preprocessor first, then model) ===
-def _feature_list(obj):
-    if obj is None:
+# === Bulletproof schema helpers ===
+def _expected_features(preproc, model=None):
+    # Prefer the preprocessor's training schema; fall back to model
+    def _feat_list(obj):
+        if obj is None:
+            return None
+        if hasattr(obj, "feature_names_in_"):
+            return list(obj.feature_names_in_)
+        if hasattr(obj, "named_steps"):
+            for step in obj.named_steps.values():
+                if hasattr(step, "feature_names_in_"):
+                    return list(step.feature_names_in_)
         return None
-    # Plain estimator or ColumnTransformer with sklearn>=1.0
-    if hasattr(obj, "feature_names_in_"):
-        return list(obj.feature_names_in_)
-    # Pipeline: find the first step that exposes feature_names_in_
-    if hasattr(obj, "named_steps"):
-        for step in obj.named_steps.values():
-            if hasattr(step, "feature_names_in_"):
-                return list(step.feature_names_in_)
-    return None
+    return _feat_list(preproc) or _feat_list(model) or []
 
-def _expected_features(model, preproc):
-    # Prefer the preprocessor’s view of the world
-    return _feature_list(preproc) or _feature_list(model)
+def _is_probably_text(colname: str) -> bool:
+    # Heuristic: names that look categorical/text-like
+    tokens = ["type","name","id","country","certification","trend",
+              "material","brand","program","eco","recycling","product","market"]
+    cl = colname.lower()
+    return any(tok in cl for tok in tokens)
 
-def _align_to_expected_schema(expected, df_in):
+def _align_to_expected_schema(expected_cols, df_in):
+    # Ensure input DataFrame matches training schema exactly
     import pandas as pd
-    if not expected:
-        return df_in.copy()
     aligned = df_in.copy()
 
-    # If model/preproc expects an encoded recycling flag, build it from string
-    if "Recycling_Programs_Encoded" in expected and "Recycling_Programs_Encoded" not in aligned.columns:
+    # Build encoded recycling if expected
+    if "Recycling_Programs_Encoded" in expected_cols and "Recycling_Programs_Encoded" not in aligned.columns:
         if "Recycling_Programs" in aligned.columns:
             aligned["Recycling_Programs_Encoded"] = (
                 aligned["Recycling_Programs"].astype(str).str.lower() == "yes"
@@ -110,36 +113,30 @@ def _align_to_expected_schema(expected, df_in):
         else:
             aligned["Recycling_Programs_Encoded"] = 0
 
-    # Create any missing columns with neutral defaults
-    missing = [c for c in expected if c not in aligned.columns]
-    for c in missing:
-        if any(tok in c.lower() for tok in [
-            "type","name","id","country","certification","trend","material",
-            "brand","program","eco","recycling","product","market"
-        ]):
-            aligned[c] = ""    # neutral string
-        else:
-            aligned[c] = 0.0   # neutral numeric
+    # Ensure every expected column exists with a neutral default
+    for c in expected_cols:
+        if c not in aligned.columns:
+            aligned[c] = "" if _is_probably_text(c) else 0.0
 
-    # Exact training order
-    aligned = aligned.reindex(columns=expected)
+    # Exact training order + drop extras
+    aligned = aligned.reindex(columns=expected_cols)
 
-    # Friendly dtype for Year if present
+    # Optional dtype cleanup
     if "Year" in aligned.columns:
         aligned["Year"] = pd.to_numeric(aligned["Year"], errors="coerce").fillna(0).astype("Int64")
 
     return aligned
 
 def predict_aligned(model, preproc, df_in):
-    exp = _expected_features(model, preproc)
-    aligned = _align_to_expected_schema(exp, df_in)
+    # Align columns then (optionally) transform and predict
+    expected = _expected_features(preproc, model)
+    aligned = _align_to_expected_schema(expected, df_in)
     if preproc is not None:
         X = preproc.transform(aligned)
         return model.predict(X)
-    else:
-        # Works if model is a Pipeline that contains its own preprocessing
-        return model.predict(aligned)
-# === end unified helpers ===
+    return model.predict(aligned)
+# === end helpers ===
+
 
 
 
@@ -257,10 +254,19 @@ if menu == f"{emoji_score} Score a Product":
             })
 
             if debug_mode:
-            st.write("🔍 Raw model input", input_df)
-            exp = _expected_features(best_model, preprocessor)
-            _aligned_preview = _align_to_expected_schema(exp, input_df)
-            st.write("🔧 Aligned columns →", list(_aligned_preview.columns))
+                exp = _expected_features(preprocessor, best_model)
+                st.write("Expected feature count:", len(exp))
+                st.write("First 10 expected:", exp[:10])
+                aligned_preview = _align_to_expected_schema(exp, input_df)
+                st.write("Aligned preview columns:", list(aligned_preview.columns)[:10], "…")
+                if preprocessor is not None:
+                    try:
+                        Xt_prev = preprocessor.transform(aligned_preview)
+                        shape = getattr(Xt_prev, "shape", None)
+                        st.write("Transformed shape:", shape)
+                    except Exception as e:
+                        st.warning(f"Preprocessor preview failed: {e}")
+
 
             # Optional: show transformed shape ONLY if we have a preprocessor
             if preprocessor is not None:
@@ -279,11 +285,13 @@ if menu == f"{emoji_score} Score a Product":
 
 
             # Predict on preprocessed, aligned features
-            pred_numeric = predict_aligned(best_model, preprocessor, input_df)[0]
+            pred_numeric = float(predict_aligned(best_model, preprocessor, input_df)[0])
 
             # Compute thresholds from a sample of the dataset (also preprocessed)
             sample_df = df.sample(500 if len(df) > 500 else len(df)).copy()
             sample_preds = predict_aligned(best_model, preprocessor, sample_df)
+
+
 
             q1 = np.percentile(sample_preds, 25)
             q2 = np.percentile(sample_preds, 50)
