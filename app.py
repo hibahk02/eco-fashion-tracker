@@ -78,29 +78,12 @@ def load_artifacts():
 best_model, preprocessor = load_artifacts()
 
 # === Bulletproof schema helpers ===
-def _expected_features(preproc, model=None):
-    # Prefer the preprocessor's training schema; fall back to model
-    def _feat_list(obj):
-        if obj is None:
-            return None
-        if hasattr(obj, "feature_names_in_"):
-            return list(obj.feature_names_in_)
-        if hasattr(obj, "named_steps"):
-            for step in obj.named_steps.values():
-                if hasattr(step, "feature_names_in_"):
-                    return list(step.feature_names_in_)
-        return None
-    return _feat_list(preproc) or _feat_list(model) or []
-
-def _is_probably_text(colname: str) -> bool:
-    # Heuristic: names that look categorical/text-like
-    tokens = ["type","name","id","country","certification","trend",
-              "material","brand","program","eco","recycling","product","market"]
-    cl = colname.lower()
-    return any(tok in cl for tok in tokens)
+def _expected_features(preproc):
+    if preproc is not None and hasattr(preproc, "feature_names_in_"):
+        return list(preproc.feature_names_in_)
+    return []
 
 def _align_to_expected_schema(expected_cols, df_in):
-    # Ensure input DataFrame matches training schema exactly
     import pandas as pd
     aligned = df_in.copy()
 
@@ -113,28 +96,37 @@ def _align_to_expected_schema(expected_cols, df_in):
         else:
             aligned["Recycling_Programs_Encoded"] = 0
 
-    # Ensure every expected column exists with a neutral default
+    # Fill any missing cols
     for c in expected_cols:
         if c not in aligned.columns:
-            aligned[c] = "" if _is_probably_text(c) else 0.0
+            # Categorical/text-like columns
+            if any(tok in c.lower() for tok in [
+                "type","name","id","country","certification","trend",
+                "material","brand","program","eco","recycling","product","market"
+            ]):
+                aligned[c] = ""
+            else:  # Numeric-like columns
+                aligned[c] = 0.0
 
-    # Exact training order + drop extras
+    # Drop extras + reorder
     aligned = aligned.reindex(columns=expected_cols)
-
-    # Optional dtype cleanup
-    if "Year" in aligned.columns:
-        aligned["Year"] = pd.to_numeric(aligned["Year"], errors="coerce").fillna(0).astype("Int64")
 
     return aligned
 
-def predict_aligned(model, preproc, df_in):
-    # Align columns then (optionally) transform and predict
-    expected = _expected_features(preproc, model)
+def predict_aligned(model, preproc, df_in, debug=False, st=None):
+    expected = _expected_features(preproc)
     aligned = _align_to_expected_schema(expected, df_in)
-    if preproc is not None:
-        X = preproc.transform(aligned)
-        return model.predict(X)
-    return model.predict(aligned)
+
+    if debug and st:
+        missing = [c for c in expected if c not in df_in.columns]
+        extra = [c for c in df_in.columns if c not in expected]
+        st.write("🔍 Expected count:", len(expected))
+        st.write("❌ Missing in input:", missing[:20], "..." if len(missing) > 20 else "")
+        st.write("⚠️ Extra in input:", extra)
+
+    X = preproc.transform(aligned)
+    return model.predict(X)
+
 # === end helpers ===
 
 
@@ -285,7 +277,7 @@ if menu == f"{emoji_score} Score a Product":
 
 
             # Predict on preprocessed, aligned features
-            pred_numeric = float(predict_aligned(best_model, preprocessor, input_df)[0])
+            pred_numeric = predict_aligned(best_model, preprocessor, input_df, debug=debug_mode, st=st)[0]
 
             # Compute thresholds from a sample of the dataset (also preprocessed)
             sample_df = df.sample(500 if len(df) > 500 else len(df)).copy()
