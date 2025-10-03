@@ -77,24 +77,31 @@ def load_artifacts():
 
 best_model, preprocessor = load_artifacts()
 
-# === Schema alignment helpers (must be above any predict calls) ===
-def _find_expected_feature_list(model):
-    if hasattr(model, "named_steps"):
-        for step in model.named_steps.values():
+# === Unified schema helpers (use preprocessor first, then model) ===
+def _feature_list(obj):
+    if obj is None:
+        return None
+    # Plain estimator or ColumnTransformer with sklearn>=1.0
+    if hasattr(obj, "feature_names_in_"):
+        return list(obj.feature_names_in_)
+    # Pipeline: find the first step that exposes feature_names_in_
+    if hasattr(obj, "named_steps"):
+        for step in obj.named_steps.values():
             if hasattr(step, "feature_names_in_"):
                 return list(step.feature_names_in_)
-    if hasattr(model, "feature_names_in_"):
-        return list(model.feature_names_in_)
     return None
 
-def _align_to_expected_schema(model, df_in):
+def _expected_features(model, preproc):
+    # Prefer the preprocessor’s view of the world
+    return _feature_list(preproc) or _feature_list(model)
+
+def _align_to_expected_schema(expected, df_in):
     import pandas as pd
-    expected = _find_expected_feature_list(model)
     if not expected:
         return df_in.copy()
     aligned = df_in.copy()
 
-    # If model expects an encoded recycling flag, create it from the string version
+    # If model/preproc expects an encoded recycling flag, build it from string
     if "Recycling_Programs_Encoded" in expected and "Recycling_Programs_Encoded" not in aligned.columns:
         if "Recycling_Programs" in aligned.columns:
             aligned["Recycling_Programs_Encoded"] = (
@@ -103,26 +110,37 @@ def _align_to_expected_schema(model, df_in):
         else:
             aligned["Recycling_Programs_Encoded"] = 0
 
-    # Fill any missing expected columns with neutral defaults
+    # Create any missing columns with neutral defaults
     missing = [c for c in expected if c not in aligned.columns]
     for c in missing:
         if any(tok in c.lower() for tok in [
             "type","name","id","country","certification","trend","material",
             "brand","program","eco","recycling","product","market"
         ]):
-            aligned[c] = ""
+            aligned[c] = ""    # neutral string
         else:
-            aligned[c] = 0.0
+            aligned[c] = 0.0   # neutral numeric
 
-    # Ensure exact training order
+    # Exact training order
     aligned = aligned.reindex(columns=expected)
+
+    # Friendly dtype for Year if present
+    if "Year" in aligned.columns:
+        aligned["Year"] = pd.to_numeric(aligned["Year"], errors="coerce").fillna(0).astype("Int64")
+
     return aligned
 
 def predict_aligned(model, preproc, df_in):
-    # Align columns, then transform with preprocessor, then predict
-    aligned = _align_to_expected_schema(model, df_in)
-    X = preproc.transform(aligned)  # dense or sparse, both are fine
-    return model.predict(X)
+    exp = _expected_features(model, preproc)
+    aligned = _align_to_expected_schema(exp, df_in)
+    if preproc is not None:
+        X = preproc.transform(aligned)
+        return model.predict(X)
+    else:
+        # Works if model is a Pipeline that contains its own preprocessing
+        return model.predict(aligned)
+# === end unified helpers ===
+
 
 
 
@@ -239,19 +257,26 @@ if menu == f"{emoji_score} Score a Product":
             })
 
             if debug_mode:
-                st.write("🔍 Debug: Model input DataFrame")
-                st.write(input_df)
-                # Optional: show transformed shape
-                _aligned_preview = _align_to_expected_schema(best_model, input_df)
-                Xt_prev = preprocessor.transform(_aligned_preview)
+            st.write("🔍 Raw model input", input_df)
+            exp = _expected_features(best_model, preprocessor)
+            _aligned_preview = _align_to_expected_schema(exp, input_df)
+            st.write("🔧 Aligned columns →", list(_aligned_preview.columns))
+
+            # Optional: show transformed shape ONLY if we have a preprocessor
+            if preprocessor is not None:
                 try:
-                    import scipy.sparse as sp
-                    if sp.issparse(Xt_prev):
-                        st.write("Transformed X (sparse) shape:", Xt_prev.shape)
-                    else:
-                        st.write("Transformed X (dense) shape:", Xt_prev.shape)
-                except Exception:
-                    pass
+                    Xt_prev = preprocessor.transform(_aligned_preview)
+                    try:
+                        import scipy.sparse as sp
+                        if sp.issparse(Xt_prev):
+                            st.write("Transformed X (sparse) shape:", Xt_prev.shape)
+                        else:
+                            st.write("Transformed X (dense) shape:", Xt_prev.shape)
+                    except Exception:
+                        st.write("Transformed X shape:", getattr(Xt_prev, "shape", "unknown"))
+                except Exception as e:
+                    st.warning(f"Preprocessor preview failed: {e}")
+
 
             # Predict on preprocessed, aligned features
             pred_numeric = predict_aligned(best_model, preprocessor, input_df)[0]
